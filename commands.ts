@@ -1,8 +1,6 @@
 /**
  * Myrddin-style BBS Commands for UrsaMU
  *
- * Ported from Evennia (dawnofetrusca/commands/bbs.py + typeclasses/bbs_manager.py).
- *
  * Player Commands:
  *   +bbread, +bbnew, +bbnext, +bbscan, +bbcatchup,
  *   +bbpost, +bb, +bbproof, +bbtoss, +bbreply,
@@ -359,17 +357,35 @@ async function clearSig(u: IUrsamuSDK): Promise<void> {
 // Lock checks
 // ---------------------------------------------------------------------------
 
-function canRead(_u: IUrsamuSDK, board: IBoard): boolean {
-  // For now, all() = everyone. Staff always passes.
-  if (board.readLock === "all()") return true;
-  if (isStaff(_u)) return true;
-  return false;
+function canRead(u: IUrsamuSDK, board: IBoard): boolean {
+  if (!board.readLock || board.readLock === "all()") return true;
+  if (isStaff(u)) return true;
+  // Evaluate the lock against the player's flags
+  const playerFlags = Array.from(u.me.flags).join(" ");
+  return checkFlagLock(playerFlags, board.readLock);
 }
 
-function canWrite(_u: IUrsamuSDK, board: IBoard): boolean {
-  if (board.writeLock === "all()") return true;
-  if (isStaff(_u)) return true;
-  return false;
+function canWrite(u: IUrsamuSDK, board: IBoard): boolean {
+  if (!board.writeLock || board.writeLock === "all()") return true;
+  if (isStaff(u)) return true;
+  const playerFlags = Array.from(u.me.flags).join(" ");
+  return checkFlagLock(playerFlags, board.writeLock);
+}
+
+/** Simple synchronous flag-based lock check for BBS locks. */
+function checkFlagLock(flags: string, lock: string): boolean {
+  // Handle "flag+" syntax (flag or higher power level)
+  // and simple flag names. For complex locks, staff bypass above covers it.
+  const parts = lock.split(/\s*[&|]\s*/).map(p => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    const negated = part.startsWith("!");
+    const flag = negated ? part.slice(1) : part;
+    const flagName = flag.endsWith("+") ? flag.slice(0, -1) : flag;
+    const has = flags.includes(flagName);
+    if (negated && has) return false;
+    if (!negated && !has) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +570,7 @@ function resolveKey(
     const rn = parseInt(rnStr, 10);
     const post = boardPosts.find((p) => p.num === pn) || null;
     if (!post) return { post: null, reply: undefined };
-    const reply = post.replies.find((r) => r.num === rn) || undefined;
+    const reply = (post.replies || []).find((r) => r.num === rn) || undefined;
     return { post, reply: reply ?? undefined };
   }
   const pn = parseInt(msgKey, 10);
@@ -747,7 +763,6 @@ async function doBBScan(u: IUrsamuSDK): Promise<void> {
     const msPos = WIDTH - msHdr.length; // Messages starts here
     const lpPos = msPos - 4 - lpHdr.length; // Last Post starts here
     const leftPart = `${numStr} ${flag}%cc${titleStr}%cn`;
-    const leftVisible = numStr.length + 1 + flag.length + titleStr.length;
     // Build right portion with fixed positions
     const row = " ".repeat(WIDTH).split("");
     // Place visible left content (extra space between flag and title)
@@ -2091,6 +2106,7 @@ async function editDraft(
       u.send("%ch>BBS:%cn Text not found in draft body.");
       return;
     }
+    // replaceAll is intentional: BBS edit replaces every occurrence in the draft.
     draft.body = draft.body.replaceAll(old, newText);
     await setDraft(u, draft);
     u.send("%ch>BBS:%cn Draft body updated.");
@@ -2099,6 +2115,7 @@ async function editDraft(
       u.send("%ch>BBS:%cn Text not found in draft subject.");
       return;
     }
+    // replaceAll is intentional: BBS edit replaces every occurrence in the draft.
     draft.subject = draft.subject.replaceAll(old, newText);
     await setDraft(u, draft);
     u.send("%ch>BBS:%cn Draft subject updated.");

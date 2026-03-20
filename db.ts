@@ -41,11 +41,6 @@ export interface IBoard {
   pendingDelete: boolean;
 }
 
-export interface IBBConfig {
-  id: string;            // "bbconfig"
-  timeout: number;       // global default timeout
-  autoTimeout: boolean;
-}
 
 // ---------------------------------------------------------------------------
 // Collections
