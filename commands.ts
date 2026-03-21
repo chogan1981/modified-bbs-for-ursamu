@@ -1,6 +1,8 @@
 /**
  * Myrddin-style BBS Commands for UrsaMU
  *
+ * Ported from Evennia (dawnofetrusca/commands/bbs.py + typeclasses/bbs_manager.py).
+ *
  * Player Commands:
  *   +bbread, +bbnew, +bbnext, +bbscan, +bbcatchup,
  *   +bbpost, +bb, +bbproof, +bbtoss, +bbreply,
@@ -41,6 +43,32 @@ function header(title: string): string {
 
 function divider(): string {
   return "-".repeat(WIDTH);
+}
+
+// Name color cache for staff ANSI names
+const _bbNameColorCache = new Map<string, string>();
+
+async function colorName(name: string): Promise<string> {
+  if (!name || name === "Anonymous" || name === "Unknown") return name;
+  const cached = _bbNameColorCache.get(name.toLowerCase());
+  if (cached !== undefined) {
+    if (!cached) return name;
+    return `${cached}${name[0]}%cn%ch%cw${name.slice(1)}%cn`;
+  }
+  try {
+    const { dbojs } = await import("../../services/Database/index.ts");
+    const results = await dbojs.query({ "data.name": new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
+    const player = results.find((r: { flags: unknown }) => {
+      if (typeof r.flags === "string") return /\bplayer\b/i.test(r.flags);
+      if (r.flags && typeof (r.flags as { has?: unknown }).has === "function") return (r.flags as Set<string>).has("player");
+      return false;
+    });
+    const nc = (player?.data?.name_color as string) || "";
+    _bbNameColorCache.set(name.toLowerCase(), nc);
+    if (nc && name.length > 0) return `${nc}${name[0]}%cn%ch%cw${name.slice(1)}%cn`;
+  } catch { /* ignore */ }
+  _bbNameColorCache.set(name.toLowerCase(), "");
+  return name;
 }
 
 function footer(): string {
@@ -357,35 +385,17 @@ async function clearSig(u: IUrsamuSDK): Promise<void> {
 // Lock checks
 // ---------------------------------------------------------------------------
 
-function canRead(u: IUrsamuSDK, board: IBoard): boolean {
-  if (!board.readLock || board.readLock === "all()") return true;
-  if (isStaff(u)) return true;
-  // Evaluate the lock against the player's flags
-  const playerFlags = Array.from(u.me.flags).join(" ");
-  return checkFlagLock(playerFlags, board.readLock);
+function canRead(_u: IUrsamuSDK, board: IBoard): boolean {
+  // For now, all() = everyone. Staff always passes.
+  if (board.readLock === "all()") return true;
+  if (isStaff(_u)) return true;
+  return false;
 }
 
-function canWrite(u: IUrsamuSDK, board: IBoard): boolean {
-  if (!board.writeLock || board.writeLock === "all()") return true;
-  if (isStaff(u)) return true;
-  const playerFlags = Array.from(u.me.flags).join(" ");
-  return checkFlagLock(playerFlags, board.writeLock);
-}
-
-/** Simple synchronous flag-based lock check for BBS locks. */
-function checkFlagLock(flags: string, lock: string): boolean {
-  // Handle "flag+" syntax (flag or higher power level)
-  // and simple flag names. For complex locks, staff bypass above covers it.
-  const parts = lock.split(/\s*[&|]\s*/).map(p => p.trim()).filter(Boolean);
-  for (const part of parts) {
-    const negated = part.startsWith("!");
-    const flag = negated ? part.slice(1) : part;
-    const flagName = flag.endsWith("+") ? flag.slice(0, -1) : flag;
-    const has = flags.includes(flagName);
-    if (negated && has) return false;
-    if (!negated && !has) return false;
-  }
-  return true;
+function canWrite(_u: IUrsamuSDK, board: IBoard): boolean {
+  if (board.writeLock === "all()") return true;
+  if (isStaff(_u)) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +455,7 @@ async function renumberPosts(boardNum: number): Promise<void> {
 // Format a post for reading
 // ---------------------------------------------------------------------------
 
-function formatPost(
+async function formatPost(
   board: IBoard,
   post: IPost,
   reply?: IReply,
@@ -458,7 +468,8 @@ function formatPost(
       : String(post.num);
   }
 
-  const author = board.anonymous ? "Anonymous" : msg.authorName;
+  const rawAuthor = board.anonymous ? "Anonymous" : msg.authorName;
+  const author = board.anonymous ? "Anonymous" : await colorName(msg.authorName);
 
   // Header: board title centered in = dividers
   const core = ` ${board.title} `;
@@ -481,13 +492,17 @@ function formatPost(
     }
   })();
 
-  // Line 2: Message / Author / Date
+  // Line 2: Message / Author / Date — author centered, date right-aligned
   const msgPart = `Message: ${board.num}/${msgKey}`;
+  const rawAuthorPart = `Author: ${rawAuthor}`;
   const authorPart = `Author: ${author}`;
   const datePart = bbDate(msg.createdAt);
-  const remaining = WIDTH - msgPart.length - authorPart.length - datePart.length;
-  const gap1 = Math.max(Math.floor(remaining / 2), 1);
-  const gap2 = Math.max(remaining - gap1, 1);
+  // Center the author between left and right edges
+  const authorCenter = Math.floor(WIDTH / 2);
+  const authorStart = Math.max(msgPart.length + 1, authorCenter - Math.floor(rawAuthorPart.length / 2));
+  const dateStart = Math.max(authorStart + rawAuthorPart.length + 1, WIDTH - datePart.length);
+  const gap1 = Math.max(authorStart - msgPart.length, 1);
+  const gap2 = Math.max(dateStart - authorStart - rawAuthorPart.length, 1);
   const infoLine =
     msgPart + " ".repeat(gap1) + authorPart + " ".repeat(gap2) + datePart;
 
@@ -763,6 +778,7 @@ async function doBBScan(u: IUrsamuSDK): Promise<void> {
     const msPos = WIDTH - msHdr.length; // Messages starts here
     const lpPos = msPos - 4 - lpHdr.length; // Last Post starts here
     const leftPart = `${numStr} ${flag}%cc${titleStr}%cn`;
+    const leftVisible = numStr.length + 1 + flag.length + titleStr.length;
     // Build right portion with fixed positions
     const row = " ".repeat(WIDTH).split("");
     // Place visible left content (extra space between flag and title)
@@ -823,7 +839,7 @@ async function doListPosts(u: IUrsamuSDK, boardStr: string): Promise<void> {
   lines.push("%cb" + DASH_LINE + "%cn");
 
   for (const post of boardPosts) {
-    const author = board.anonymous ? "Anonymous" : post.authorName;
+    const author = board.anonymous ? "Anonymous" : await colorName(post.authorName);
     const msgNum = `${board.num}/${post.num}`;
     const dateStr = bbDate(post.createdAt);
     const subj = post.subject.slice(0, 42);
@@ -843,7 +859,7 @@ async function doListPosts(u: IUrsamuSDK, boardStr: string): Promise<void> {
       const isLast = i === sortedReplies.length - 1;
       const connector = isLast ? "`" : "|";
       const replyKey = `${board.num}/${post.num}.${reply.num}`;
-      const rAuthor = board.anonymous ? "Anonymous" : reply.authorName;
+      const rAuthor = board.anonymous ? "Anonymous" : await colorName(reply.authorName);
       const rSubj = reply.subject.slice(0, 38);
       const rDate = bbDate(reply.createdAt);
       lines.push(
@@ -890,14 +906,14 @@ async function doReadPosts(
       u.send("%ch>BBS:%cn Post not found.");
       return;
     }
-    const output: string[] = [formatPost(board, post)];
+    const output: string[] = [await formatPost(board, post)];
     await markRead(u, board.num, String(postNum));
     const sortedReplies = [...(post.replies || [])].sort(
       (a, b) => a.num - b.num,
     );
     for (const reply of sortedReplies) {
       const rk = `${postNum}.${reply.num}`;
-      output.push(formatPost(board, post, reply, rk));
+      output.push(await formatPost(board, post, reply, rk));
       await markRead(u, board.num, rk);
     }
     u.send(output.join("\n\n"));
@@ -925,7 +941,7 @@ async function doReadPosts(
     }
     const msgKey = `${postNum}.${replyNum}`;
     await markRead(u, board.num, msgKey);
-    u.send(formatPost(board, post, reply, msgKey));
+    u.send(await formatPost(board, post, reply, msgKey));
     return;
   }
 
@@ -943,7 +959,7 @@ async function doReadPosts(
     for (const key of unreadKeys) {
       const { post, reply } = resolveKey(boardPosts, key);
       if (post) {
-        output.push(formatPost(board, post, reply, key));
+        output.push(await formatPost(board, post, reply, key));
         await markRead(u, board.num, key);
       }
     }
@@ -965,7 +981,7 @@ async function doReadPosts(
   for (const pn of spec) {
     const post = await getPost(board.num, pn);
     if (!post) continue;
-    output.push(formatPost(board, post));
+    output.push(await formatPost(board, post));
     await markRead(u, board.num, String(pn));
   }
 
@@ -1016,12 +1032,15 @@ addCmd({
       const { post, reply } = resolveKey(boardPosts, key);
       if (!post) continue;
       const msg = reply || post;
-      const author = board.anonymous ? "Anonymous" : msg.authorName;
+      const rawAuthorNew = board.anonymous ? "Anonymous" : msg.authorName;
+      const authorNew = board.anonymous ? "Anonymous" : await colorName(msg.authorName);
+      const authorPad = " ".repeat(Math.max(1, 16 - rawAuthorNew.slice(0, 14).length));
       lines.push(
         " " +
           key.padEnd(6) +
           msg.subject.slice(0, 33).padEnd(35) +
-          author.slice(0, 14).padEnd(16) +
+          authorNew +
+          authorPad +
           bbDate(msg.createdAt),
       );
     }
@@ -1067,7 +1086,7 @@ addCmd({
         ? `${post.num}.${reply.num}`
         : String(post.num);
       await markRead(u, board.num, msgKey);
-      u.send(formatPost(board, post, reply, msgKey));
+      u.send(await formatPost(board, post, reply, msgKey));
       return;
     }
 
@@ -1087,7 +1106,7 @@ addCmd({
         ? `${post.num}.${reply.num}`
         : String(post.num);
       await markRead(u, board.num, msgKey);
-      u.send(formatPost(board, post, reply, msgKey));
+      u.send(await formatPost(board, post, reply, msgKey));
       return;
     }
 
@@ -1235,7 +1254,7 @@ addCmd({
     // Check for quick post: subject=body
     if (rest.includes("=")) {
       const eqIdx = rest.indexOf("=");
-      const subject = rest.slice(0, eqIdx).trim();
+      const subject = rest.slice(0, eqIdx).trim().slice(0, 60);
       let body = rest.slice(eqIdx + 1).trim();
       if (!subject || !body) {
         u.send("%ch>BBS:%cn Usage: +bbpost <#>/<subject>=<body>");
@@ -1277,7 +1296,7 @@ addCmd({
       await notifyBoard(
         u,
         board,
-        `%ch>BBS:%cn New post on %ch${board.title}%cn (#${board.num}/${postNum}): %ch${subject}%cn by ${newPost.authorName}`,
+        `%ch>BBS:%cn New post on %ch${board.title}%cn (#${board.num}/${postNum}): %ch${subject}%cn by ${await colorName(newPost.authorName)}`,
       );
       return;
     }
@@ -1389,7 +1408,7 @@ async function submitDraft(u: IUrsamuSDK): Promise<void> {
     await notifyBoard(
       u,
       board,
-      `%ch>BBS:%cn New reply on %ch${board.title}%cn (#${board.num}/${replyKey}): %ch${newReply.subject}%cn by ${newReply.authorName}`,
+      `%ch>BBS:%cn New reply on %ch${board.title}%cn (#${board.num}/${replyKey}): %ch${newReply.subject}%cn by ${await colorName(newReply.authorName)}`,
     );
     return;
   }
@@ -1425,7 +1444,7 @@ async function submitDraft(u: IUrsamuSDK): Promise<void> {
   await notifyBoard(
     u,
     board,
-    `%ch>BBS:%cn New post on %ch${board.title}%cn (#${board.num}/${postNum}): %ch${draft.subject}%cn by ${newPost.authorName}`,
+    `%ch>BBS:%cn New post on %ch${board.title}%cn (#${board.num}/${postNum}): %ch${draft.subject}%cn by ${await colorName(newPost.authorName)}`,
   );
 }
 
@@ -1760,6 +1779,10 @@ addCmd({
     const { board: toBoard, error: toErr } = await findBoard(destStr);
     if (!toBoard) {
       u.send(`%ch>BBS:%cn Destination: ${toErr}`);
+      return;
+    }
+    if (!canWrite(u, toBoard)) {
+      u.send("%ch>BBS:%cn You don't have permission to post to the destination board.");
       return;
     }
 
@@ -2281,6 +2304,10 @@ addCmd({
     const args = (u.cmd.args[0] || "").trim();
     if (!args) {
       u.send("%ch>BBS:%cn Usage: +bbnewgroup <title>");
+      return;
+    }
+    if (args.length > 40) {
+      u.send("%ch>BBS:%cn Board title must be 40 characters or fewer.");
       return;
     }
 

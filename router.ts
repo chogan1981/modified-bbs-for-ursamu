@@ -18,24 +18,25 @@ async function isStaffUser(userId: string | null): Promise<boolean> {
   return flags.includes("admin") || flags.includes("wizard") || flags.includes("superuser");
 }
 
+async function canReadBoard(board: IBoard, userId: string): Promise<boolean> {
+  if (board.readLock === "all()" || !board.readLock) return true;
+  return await isStaffUser(userId);
+}
+
+async function canWriteBoard(board: IBoard, userId: string): Promise<boolean> {
+  if (board.writeLock === "all()" || !board.writeLock) return true;
+  return await isStaffUser(userId);
+}
+
 async function getNewCountForUser(
   boardNum: number,
   userId: string
 ): Promise<number> {
   const player = await dbojs.queryOne({ id: userId });
-  // Use the same bb_read tracking as the in-game commands (per-message key set)
-  const bbRead = ((player && player.data?.bb_read) as Record<string, string[]>) || {};
-  const readKeys = new Set(bbRead[String(boardNum)] || []);
+  const lastRead = ((player && player.data?.bbLastRead) as Record<string, number>) || {};
+  const lastReadNum = lastRead[String(boardNum)] || 0;
   const allPosts = await posts.query({ boardId: boardNum });
-  // Count posts and replies that aren't in the read set
-  let unread = 0;
-  for (const post of allPosts) {
-    if (!readKeys.has(String(post.num))) unread++;
-    for (const reply of (post.replies || [])) {
-      if (!readKeys.has(`${post.num}.${reply.num}`)) unread++;
-    }
-  }
-  return unread;
+  return allPosts.filter((p) => p.num > lastReadNum).length;
 }
 
 // ─── route handler ────────────────────────────────────────────────────────────
@@ -55,8 +56,14 @@ export async function bboardsRouteHandler(
     const all = await boards.query({});
     all.sort((a, b) => a.num - b.num);
 
+    // Filter out boards the user can't read
+    const visible: IBoard[] = [];
+    for (const b of all) {
+      if (await canReadBoard(b, userId)) visible.push(b);
+    }
+
     const result = await Promise.all(
-      all.map(async (b) => {
+      visible.map(async (b) => {
         const boardPosts = await posts.query({ boardId: b.num });
         const newCount = await getNewCountForUser(b.num, userId);
         return { ...b, postCount: boardPosts.length, newCount };
@@ -78,11 +85,12 @@ export async function bboardsRouteHandler(
       return jsonResponse({ error: "Invalid JSON body" }, 400);
     }
 
-    const title = typeof body.name === "string" ? body.name.trim() : "";
+    const title = typeof body.name === "string" ? body.name.trim().slice(0, 40) : "";
     if (!title) return jsonResponse({ error: "name is required" }, 400);
 
     const allBoards = await boards.query({});
-    const num = typeof body.order === "number" ? body.order : allBoards.length + 1;
+    const rawNum = typeof body.order === "number" ? body.order : allBoards.length + 1;
+    const num = Math.max(1, Math.floor(rawNum));
 
     const existing = await boards.queryOne({ num });
     if (existing) return jsonResponse({ error: "Board already exists" }, 409);
@@ -106,17 +114,21 @@ export async function bboardsRouteHandler(
   }
 
   // ── GET /api/v1/boards/unread ────────────────────────────────────────────
+  // IMPORTANT: This must come BEFORE the /api/v1/boards/:id regex match below,
+  // otherwise "unread" would be treated as a board ID.
   if (path === "/api/v1/boards/unread" && method === "GET") {
     const all = await boards.query({});
-    const result = await Promise.all(
-      all.map(async (b) => ({
+    const entries: Array<{ boardId: string; boardName: string; newCount: number }> = [];
+    for (const b of all) {
+      if (!(await canReadBoard(b, userId))) continue;
+      entries.push({
         boardId: b.id,
         boardName: b.title,
         newCount: await getNewCountForUser(b.num, userId),
-      }))
-    );
-    const total = result.reduce((sum, r) => sum + r.newCount, 0);
-    return jsonResponse({ total, boards: result.filter((r) => r.newCount > 0) });
+      });
+    }
+    const total = entries.reduce((sum, r) => sum + r.newCount, 0);
+    return jsonResponse({ total, boards: entries.filter((r) => r.newCount > 0) });
   }
 
   // ── board by :id sub-routes ──────────────────────────────────────────────
@@ -135,6 +147,7 @@ export async function bboardsRouteHandler(
 
     // ── GET /api/v1/boards/:id ─────────────────────────────────────────────
     if (!sub && method === "GET") {
+      if (!(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const boardPosts = await posts.query({ boardId: board.num });
       const newCount = await getNewCountForUser(board.num, userId);
       return jsonResponse({ ...board, postCount: boardPosts.length, newCount });
@@ -152,11 +165,12 @@ export async function bboardsRouteHandler(
         return jsonResponse({ error: "Invalid JSON body" }, 400);
       }
 
-      const ALLOWED = ["title", "timeout", "anonymous", "readLock", "writeLock"];
       const update: Partial<IBoard> = {};
-      for (const field of ALLOWED) {
-        if (field in body) (update as Record<string, unknown>)[field] = body[field];
-      }
+      if (typeof body.title === "string") update.title = body.title.trim().slice(0, 40);
+      if (typeof body.timeout === "number") update.timeout = Math.max(0, Math.floor(body.timeout));
+      if (typeof body.anonymous === "boolean") update.anonymous = body.anonymous;
+      if (typeof body.readLock === "string") update.readLock = body.readLock;
+      if (typeof body.writeLock === "string") update.writeLock = body.writeLock;
       const updated: IBoard = { ...board, ...update };
       await boards.update({ id: board.id }, updated);
       return jsonResponse(updated);
@@ -174,6 +188,7 @@ export async function bboardsRouteHandler(
 
     // ── GET /api/v1/boards/:id/posts ───────────────────────────────────────
     if (sub === "/posts" && method === "GET") {
+      if (!(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const params = url.searchParams;
       const limit  = Math.min(parseInt(params.get("limit")  || "50", 10), 200);
       const offset = Math.max(parseInt(params.get("offset") || "0",  10), 0);
@@ -186,6 +201,7 @@ export async function bboardsRouteHandler(
 
     // ── POST /api/v1/boards/:id/posts ──────────────────────────────────────
     if (sub === "/posts" && method === "POST") {
+      if (!(await canWriteBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       let body: Record<string, unknown>;
       try {
         body = await req.json();
@@ -193,7 +209,7 @@ export async function bboardsRouteHandler(
         return jsonResponse({ error: "Invalid JSON body" }, 400);
       }
 
-      const subject = typeof body.subject === "string" ? body.subject.trim() : "";
+      const subject = typeof body.subject === "string" ? body.subject.trim().slice(0, 60) : "";
       const postBody  = typeof body.body    === "string" ? body.body.trim()    : "";
       if (!subject || !postBody) return jsonResponse({ error: "subject and body are required" }, 400);
 
@@ -228,6 +244,7 @@ export async function bboardsRouteHandler(
 
     // ── GET /api/v1/boards/:id/posts/:num ─────────────────────────────────
     if (sub.startsWith("/posts/") && !isNaN(postNum) && method === "GET") {
+      if (!(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
       return jsonResponse(post);
@@ -249,7 +266,7 @@ export async function bboardsRouteHandler(
       }
 
       const newBody    = typeof body.body    === "string" ? body.body.trim()    : post.body;
-      const newSubject = typeof body.subject === "string" ? body.subject.trim() : post.subject;
+      const newSubject = typeof body.subject === "string" ? body.subject.trim().slice(0, 60) : post.subject;
 
       const updated: IPost = { ...post, body: newBody, subject: newSubject, editCount: post.editCount + 1 };
       await posts.update({ id: post.id }, updated);
@@ -270,27 +287,17 @@ export async function bboardsRouteHandler(
 
     // ── POST /api/v1/boards/:id/read ──────────────────────────────────────
     if (sub === "/read" && method === "POST") {
-      // Mark all posts and replies on this board as read, using the same
-      // bb_read tracking as the in-game commands
       const boardPosts = await posts.query({ boardId: board.num });
-      const allKeys: string[] = [];
-      for (const post of boardPosts) {
-        allKeys.push(String(post.num));
-        for (const reply of (post.replies || [])) {
-          allKeys.push(`${post.num}.${reply.num}`);
-        }
-      }
+      const maxNum = boardPosts.reduce((m, p) => Math.max(m, p.num), 0);
 
       const player = await dbojs.queryOne({ id: userId });
       if (player) {
-        player.data ||= {};
-        const bbRead = (player.data.bb_read as Record<string, string[]>) || {};
-        bbRead[String(board.num)] = allKeys;
-        player.data.bb_read = bbRead;
-        await dbojs.modify({ id: player.id }, "$set", { "data.bb_read": bbRead });
+        const lastRead = ((player.data?.bbLastRead) as Record<string, number>) || {};
+        lastRead[String(board.num)] = maxNum;
+        await dbojs.modify({ id: player.id }, "$set", { "data.bbLastRead": lastRead } as Partial<typeof player>);
       }
 
-      return jsonResponse({ boardId: board.id, markedRead: allKeys.length });
+      return jsonResponse({ boardId: board.id, lastRead: maxNum });
     }
   }
 
