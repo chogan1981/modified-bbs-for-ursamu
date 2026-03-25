@@ -1,4 +1,5 @@
 import { dbojs } from "../../services/Database/index.ts";
+import { broadcast } from "../../services/broadcast/index.ts";
 import { boards, posts, getNextPostId } from "./db.ts";
 import type { IBoard, IPost } from "./db.ts";
 
@@ -49,29 +50,38 @@ export async function bboardsRouteHandler(
   const path   = url.pathname;
   const method = req.method;
 
-  if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
+  // Public boards (1, 2, 3, 11) are readable without auth
+  const PUBLIC_BOARDS = new Set([1, 2, 3, 11]);
+  const isPublicRead = method === "GET" && !userId;
 
   // ── GET /api/v1/boards ───────────────────────────────────────────────────
   if (path === "/api/v1/boards" && method === "GET") {
     const all = await boards.query({});
     all.sort((a, b) => a.num - b.num);
 
-    // Filter out boards the user can't read
+    // Filter: logged-in users see boards they can read; anonymous see public boards only
     const visible: IBoard[] = [];
     for (const b of all) {
-      if (await canReadBoard(b, userId)) visible.push(b);
+      if (userId) {
+        if (await canReadBoard(b, userId)) visible.push(b);
+      } else if (PUBLIC_BOARDS.has(b.num)) {
+        visible.push(b);
+      }
     }
 
     const result = await Promise.all(
       visible.map(async (b) => {
         const boardPosts = await posts.query({ boardId: b.num });
-        const newCount = await getNewCountForUser(b.num, userId);
+        const newCount = userId ? await getNewCountForUser(b.num, userId) : 0;
         return { ...b, postCount: boardPosts.length, newCount };
       })
     );
 
     return jsonResponse(result);
   }
+
+  // All non-GET requests require auth
+  if (!userId && method !== "GET") return jsonResponse({ error: "Unauthorized" }, 401);
 
   // ── POST /api/v1/boards ──────────────────────────────────────────────────
   if (path === "/api/v1/boards" && method === "POST") {
@@ -116,7 +126,7 @@ export async function bboardsRouteHandler(
   // ── GET /api/v1/boards/unread ────────────────────────────────────────────
   // IMPORTANT: This must come BEFORE the /api/v1/boards/:id regex match below,
   // otherwise "unread" would be treated as a board ID.
-  if (path === "/api/v1/boards/unread" && method === "GET") {
+  if (path === "/api/v1/boards/unread" && method === "GET" && userId) {
     const all = await boards.query({});
     const entries: Array<{ boardId: string; boardName: string; newCount: number }> = [];
     for (const b of all) {
@@ -132,11 +142,12 @@ export async function bboardsRouteHandler(
   }
 
   // ── board by :id sub-routes ──────────────────────────────────────────────
-  const boardMatch = path.match(/^\/api\/v1\/boards\/([^/]+)(\/posts(?:\/(\d+))?|\/read)?$/);
+  const boardMatch = path.match(/^\/api\/v1\/boards\/([^/]+)(\/posts(?:\/(\d+)(?:\/replies(?:\/(\d+))?)?)?|\/read)?$/);
   if (boardMatch) {
     const boardId  = boardMatch[1];
     const sub      = boardMatch[2] || "";
     const postNum  = boardMatch[3] ? parseInt(boardMatch[3], 10) : NaN;
+    const replyNum = boardMatch[4] ? parseInt(boardMatch[4], 10) : NaN;
 
     // Try to find board by numeric id or string id
     const boardNum = parseInt(boardId, 10);
@@ -147,7 +158,8 @@ export async function bboardsRouteHandler(
 
     // ── GET /api/v1/boards/:id ─────────────────────────────────────────────
     if (!sub && method === "GET") {
-      if (!(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
+      if (!userId && !PUBLIC_BOARDS.has(board.num)) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (userId && !(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const boardPosts = await posts.query({ boardId: board.num });
       const newCount = await getNewCountForUser(board.num, userId);
       return jsonResponse({ ...board, postCount: boardPosts.length, newCount });
@@ -188,7 +200,8 @@ export async function bboardsRouteHandler(
 
     // ── GET /api/v1/boards/:id/posts ───────────────────────────────────────
     if (sub === "/posts" && method === "GET") {
-      if (!(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
+      if (!userId && !PUBLIC_BOARDS.has(board.num)) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (userId && !(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const params = url.searchParams;
       const limit  = Math.min(parseInt(params.get("limit")  || "50", 10), 200);
       const offset = Math.max(parseInt(params.get("offset") || "0",  10), 0);
@@ -239,19 +252,21 @@ export async function bboardsRouteHandler(
       };
 
       await posts.create(post);
+      broadcast(`%ch>BBS:%cn New post on ${board.title} (#${board.num}/${num}) by ${post.authorName}: ${subject}`);
       return jsonResponse(post, 201);
     }
 
     // ── GET /api/v1/boards/:id/posts/:num ─────────────────────────────────
-    if (sub.startsWith("/posts/") && !isNaN(postNum) && method === "GET") {
-      if (!(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
+    if (sub.startsWith("/posts/") && !sub.includes("/replies") && !isNaN(postNum) && method === "GET") {
+      if (!userId && !PUBLIC_BOARDS.has(board.num)) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (userId && !(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
       return jsonResponse(post);
     }
 
     // ── PATCH /api/v1/boards/:id/posts/:num ────────────────────────────────
-    if (sub.startsWith("/posts/") && !isNaN(postNum) && method === "PATCH") {
+    if (sub.startsWith("/posts/") && !sub.includes("/replies") && !isNaN(postNum) && method === "PATCH") {
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
 
@@ -274,7 +289,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── DELETE /api/v1/boards/:id/posts/:num ──────────────────────────────
-    if (sub.startsWith("/posts/") && !isNaN(postNum) && method === "DELETE") {
+    if (sub.startsWith("/posts/") && !sub.includes("/replies") && !isNaN(postNum) && method === "DELETE") {
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
 
@@ -282,6 +297,86 @@ export async function bboardsRouteHandler(
       if (post.authorId !== userId && !staff) return jsonResponse({ error: "Forbidden" }, 403);
 
       await posts.delete({ id: post.id });
+      return jsonResponse({ deleted: true });
+    }
+
+    // ── POST /api/v1/boards/:id/posts/:num/replies ────────────────────────
+    if (sub.includes("/replies") && !isNaN(postNum) && isNaN(replyNum) && method === "POST") {
+      if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
+      if (!(await canWriteBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
+
+      const post = await posts.queryOne({ boardId: board.num, num: postNum });
+      if (!post) return jsonResponse({ error: "Post not found" }, 404);
+
+      let body: Record<string, unknown>;
+      try { body = await req.json(); } catch { return jsonResponse({ error: "Invalid JSON body" }, 400); }
+
+      const replyBody = typeof body.body === "string" ? body.body.trim() : "";
+      if (!replyBody) return jsonResponse({ error: "body is required" }, 400);
+
+      const player = await dbojs.queryOne({ id: userId });
+      const authorName = (player && player.data?.name) || userId;
+
+      const replies = post.replies || [];
+      const num = replies.length > 0 ? Math.max(...replies.map((r) => r.num)) + 1 : 1;
+
+      const reply = {
+        num,
+        subject: `Re: ${post.subject}`,
+        body: replyBody,
+        authorId: userId,
+        authorName: String(authorName),
+        createdAt: Date.now(),
+        editCount: 0,
+      };
+
+      replies.push(reply);
+      const updated = { ...post, replies };
+      await posts.update({ id: post.id }, updated);
+      broadcast(`%ch>BBS:%cn New reply on ${board.title} (#${board.num}/${post.num}) by ${reply.authorName}: Re: ${post.subject}`);
+      return jsonResponse(reply, 201);
+    }
+
+    // ── PATCH /api/v1/boards/:id/posts/:num/replies/:rnum ───────────────
+    if (sub.includes("/replies/") && !isNaN(postNum) && !isNaN(replyNum) && method === "PATCH") {
+      if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
+      const post = await posts.queryOne({ boardId: board.num, num: postNum });
+      if (!post) return jsonResponse({ error: "Post not found" }, 404);
+
+      const replies = post.replies || [];
+      const reply = replies.find((r) => r.num === replyNum);
+      if (!reply) return jsonResponse({ error: "Reply not found" }, 404);
+
+      const staff = await isStaffUser(userId);
+      if (reply.authorId !== userId && !staff) return jsonResponse({ error: "Forbidden" }, 403);
+
+      let body: Record<string, unknown>;
+      try { body = await req.json(); } catch { return jsonResponse({ error: "Invalid JSON body" }, 400); }
+
+      if (typeof body.body === "string") reply.body = body.body.trim();
+      reply.editCount = (reply.editCount || 0) + 1;
+
+      const updated = { ...post, replies };
+      await posts.update({ id: post.id }, updated);
+      return jsonResponse(reply);
+    }
+
+    // ── DELETE /api/v1/boards/:id/posts/:num/replies/:rnum ──────────────
+    if (sub.includes("/replies/") && !isNaN(postNum) && !isNaN(replyNum) && method === "DELETE") {
+      if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
+      const post = await posts.queryOne({ boardId: board.num, num: postNum });
+      if (!post) return jsonResponse({ error: "Post not found" }, 404);
+
+      const replies = post.replies || [];
+      const reply = replies.find((r) => r.num === replyNum);
+      if (!reply) return jsonResponse({ error: "Reply not found" }, 404);
+
+      const staff = await isStaffUser(userId);
+      if (reply.authorId !== userId && !staff) return jsonResponse({ error: "Forbidden" }, 403);
+
+      const filtered = replies.filter((r) => r.num !== replyNum);
+      const updated = { ...post, replies: filtered };
+      await posts.update({ id: post.id }, updated);
       return jsonResponse({ deleted: true });
     }
 
