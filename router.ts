@@ -142,7 +142,7 @@ export async function bboardsRouteHandler(
   }
 
   // ── board by :id sub-routes ──────────────────────────────────────────────
-  const boardMatch = path.match(/^\/api\/v1\/boards\/([^/]+)(\/posts(?:\/(\d+)(?:\/replies(?:\/(\d+))?)?)?|\/read)?$/);
+  const boardMatch = path.match(/^\/api\/v1\/boards\/([^/]+)(\/posts(?:\/(\d+)(?:\/repl(?:y|ies)(?:\/(\d+))?)?)?|\/read)?$/);
   if (boardMatch) {
     const boardId  = boardMatch[1];
     const sub      = boardMatch[2] || "";
@@ -257,7 +257,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── GET /api/v1/boards/:id/posts/:num ─────────────────────────────────
-    if (sub.startsWith("/posts/") && !sub.includes("/replies") && !isNaN(postNum) && method === "GET") {
+    if (sub.startsWith("/posts/") && !sub.includes("/repl") && !isNaN(postNum) && method === "GET") {
       if (!userId && !PUBLIC_BOARDS.has(board.num)) return jsonResponse({ error: "Unauthorized" }, 401);
       if (userId && !(await canReadBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
@@ -266,7 +266,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── PATCH /api/v1/boards/:id/posts/:num ────────────────────────────────
-    if (sub.startsWith("/posts/") && !sub.includes("/replies") && !isNaN(postNum) && method === "PATCH") {
+    if (sub.startsWith("/posts/") && !sub.includes("/repl") && !isNaN(postNum) && method === "PATCH") {
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
 
@@ -289,7 +289,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── DELETE /api/v1/boards/:id/posts/:num ──────────────────────────────
-    if (sub.startsWith("/posts/") && !sub.includes("/replies") && !isNaN(postNum) && method === "DELETE") {
+    if (sub.startsWith("/posts/") && !sub.includes("/repl") && !isNaN(postNum) && method === "DELETE") {
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
 
@@ -301,7 +301,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── POST /api/v1/boards/:id/posts/:num/replies ────────────────────────
-    if (sub.includes("/replies") && !isNaN(postNum) && isNaN(replyNum) && method === "POST") {
+    if (sub.includes("/repl") && !isNaN(postNum) && isNaN(replyNum) && method === "POST") {
       if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
       if (!(await canWriteBoard(board, userId))) return jsonResponse({ error: "Forbidden" }, 403);
 
@@ -338,7 +338,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── PATCH /api/v1/boards/:id/posts/:num/replies/:rnum ───────────────
-    if (sub.includes("/replies/") && !isNaN(postNum) && !isNaN(replyNum) && method === "PATCH") {
+    if (sub.match(/\/repl(y|ies)\//) && !isNaN(postNum) && !isNaN(replyNum) && method === "PATCH") {
       if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);
@@ -362,7 +362,7 @@ export async function bboardsRouteHandler(
     }
 
     // ── DELETE /api/v1/boards/:id/posts/:num/replies/:rnum ──────────────
-    if (sub.includes("/replies/") && !isNaN(postNum) && !isNaN(replyNum) && method === "DELETE") {
+    if (sub.match(/\/repl(y|ies)\//) && !isNaN(postNum) && !isNaN(replyNum) && method === "DELETE") {
       if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
       const post = await posts.queryOne({ boardId: board.num, num: postNum });
       if (!post) return jsonResponse({ error: "Post not found" }, 404);

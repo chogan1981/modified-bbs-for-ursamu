@@ -645,6 +645,7 @@ export async function cleanupExpiredPosts(): Promise<number> {
     const boardTimeout = board.timeout || cfg.timeout;
     if (boardTimeout <= 0) continue;
 
+    let boardRemoved = 0;
     const boardPosts = await getBoardPosts(board.num);
     for (const post of boardPosts) {
       const postTimeout = post.timeout || boardTimeout;
@@ -654,11 +655,12 @@ export async function cleanupExpiredPosts(): Promise<number> {
       const timeoutMs = postTimeout * 24 * 60 * 60 * 1000;
       if (ageMs > timeoutMs) {
         await posts.delete({ id: post.id });
+        boardRemoved++;
         removed++;
       }
     }
 
-    if (removed > 0) {
+    if (boardRemoved > 0) {
       await renumberPosts(board.num);
     }
   }
@@ -858,13 +860,17 @@ async function doListPosts(u: IUrsamuSDK, boardStr: string): Promise<void> {
       const reply = sortedReplies[i];
       const isLast = i === sortedReplies.length - 1;
       const connector = isLast ? "`" : "|";
-      const replyKey = `${board.num}/${post.num}.${reply.num}`;
+      const replyKey = `${post.num}.${reply.num}`;
       const rAuthor = board.anonymous ? "Anonymous" : await colorName(reply.authorName);
       const rSubj = reply.subject.slice(0, 38);
       const rDate = bbDate(reply.createdAt);
+      // Prefix is "  c  " (5 chars) + key + subject must total 50 to align with main post
+      const prefix = `  ${connector}  %cc${replyKey}%cn`;
+      const prefixVisible = 5 + replyKey.length; // "  c  " + key
+      const subjPad = Math.max(1, 50 - prefixVisible);
       lines.push(
-        `  ${connector}  %cc${replyKey.padEnd(5)}%cn` +
-          rSubj.padEnd(41) +
+        prefix +
+          rSubj.padEnd(subjPad) +
           rDate.padEnd(13) +
           rAuthor,
       );
@@ -1254,7 +1260,7 @@ addCmd({
     // Check for quick post: subject=body
     if (rest.includes("=")) {
       const eqIdx = rest.indexOf("=");
-      const subject = rest.slice(0, eqIdx).trim().slice(0, 60);
+      const subject = rest.slice(0, eqIdx).trim();
       let body = rest.slice(eqIdx + 1).trim();
       if (!subject || !body) {
         u.send("%ch>BBS:%cn Usage: +bbpost <#>/<subject>=<body>");
@@ -1397,7 +1403,7 @@ async function submitDraft(u: IUrsamuSDK): Promise<void> {
       editCount: 0,
     };
 
-    const updatedReplies = [...post.replies, newReply];
+    const updatedReplies = [...(post.replies || []), newReply];
     await posts.modify({ id: post.id }, "$set", { replies: updatedReplies });
     const replyKey = `${post.num}.${replyNum}`;
     await clearDraft(u);
@@ -1700,7 +1706,7 @@ addCmd({
         u.send("%ch>BBS:%cn You can only remove your own replies.");
         return;
       }
-      const updatedReplies = post.replies.filter((r) => r.num !== replyNum);
+      const updatedReplies = (post.replies || []).filter((r) => r.num !== replyNum);
       await posts.modify({ id: post.id }, "$set", {
         replies: updatedReplies,
       });
@@ -1779,10 +1785,6 @@ addCmd({
     const { board: toBoard, error: toErr } = await findBoard(destStr);
     if (!toBoard) {
       u.send(`%ch>BBS:%cn Destination: ${toErr}`);
-      return;
-    }
-    if (!canWrite(u, toBoard)) {
-      u.send("%ch>BBS:%cn You don't have permission to post to the destination board.");
       return;
     }
 
@@ -2195,7 +2197,7 @@ async function editPost(
     }
     reply.body = reply.body.replaceAll(old, newText);
     reply.editCount = (reply.editCount || 0) + 1;
-    const updatedReplies = post.replies.map((r) =>
+    const updatedReplies = (post.replies || []).map((r) =>
       r.num === replyNum ? reply : r
     );
     await posts.modify({ id: post.id }, "$set", {
@@ -2304,10 +2306,6 @@ addCmd({
     const args = (u.cmd.args[0] || "").trim();
     if (!args) {
       u.send("%ch>BBS:%cn Usage: +bbnewgroup <title>");
-      return;
-    }
-    if (args.length > 40) {
-      u.send("%ch>BBS:%cn Board title must be 40 characters or fewer.");
       return;
     }
 
@@ -2685,21 +2683,54 @@ addCmd({
 
 const BBHELP_TOPICS: Record<string, string> = {
   "": [
-    "                    Commands for the BBS System",
+    "----------------------------------[ +BBS ]-----------------------------------",
+    "The Bulletin Board System for reading and posting announcements, IC news, and",
+    "discussion.",
+    "",
+    "  Reading",
+    "  -------",
+    "  +bbread                List all boards",
+    "  +bbread <#>            List posts on a board",
+    "  +bbread <#>/<#>        Read a specific post",
+    "  +bbscan                Show all unread postings",
+    "  +bbnew <#>             List unread messages in a board",
+    "  +bbnext                Read the next unread message",
+    "  +bbsearch <#>/<name>   Search a board for posts by a player",
+    "",
+    "  Posting",
+    "  -------",
+    "  +bbpost <#>/<title>           Start a new post to a board",
+    "  +bbpost <#>/<subj>=<body>     Quick-post in one command",
+    "  +bb <text>                    Add text to your post in progress",
+    "  +bbproof                      Preview your post in progress",
+    "  +bbtoss                       Discard your post in progress",
+    "  +bbpost                       Submit your finished post",
+    "",
+    "  Replies",
+    "  -------",
+    "  +bbreply <#>/<#>              Start a threaded reply to a post",
+    "  +bbreply <#>/<#>=<body>       Quick-reply in one command",
+    "",
+    "  Editing & Removing",
+    "  ------------------",
+    "  +bbedit <#>/<#>=<old>/<new>   Edit one of your posted messages",
+    "  +bbremove <#>/<list>          Remove your post(s)",
+    "  +bbmove <#>/<#> to <#>        Move a post to another board",
+    "",
+    "  Catchup & Subscription",
+    "  ----------------------",
+    "  +bbcatchup <#>                Mark a board as read",
+    "  +bbcatchup all                Mark all boards as read",
+    "  +bbleave <#>                  Unsubscribe from a board",
+    "  +bbjoin <#>                   Rejoin a board you left",
+    "  +bblist                       List all boards with timeout values",
+    "  +bbnotify <#>=<on/off>        Toggle post notifications",
+    "  +bbsig [text]                 Set your BBS signature",
+    "  +bbsig /clear                 Clear your BBS signature",
+    "",
+    "  You can use a board's name (or abbreviation) in place of its number.",
+    "  For more detail: +bbhelp bbread, +bbhelp bbpost, +bbhelp bbmisc",
     "-----------------------------------------------------------------------------",
-    "     This BBS was inspired by Myrddin's BBS for MUSHes.",
-    "     To see help on a particular topic, type '+bbhelp <topic>'",
-    "     (Example: +bbhelp bbread).",
-    "",
-    "     TOPIC                 DESCRIPTION",
-    "     ~~~~~                 ~~~~~~~~~~~",
-    "     bbread                Reading bulletin board messages.",
-    "     bbpost                Posting bulletin board messages.",
-    "     bbmisc                Other commands (removing messages, unsubscribing",
-    "                             groups, resubscribing to groups, etc)",
-    "",
-    "     bbtimeout             Expanded help on the topic of message timeouts.",
-    "=============================================================================",
   ].join("\n"),
   "bbread": [
     "                   Commands for the BBS System:",
